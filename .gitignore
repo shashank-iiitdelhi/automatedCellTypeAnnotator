@@ -1,0 +1,12 @@
+*.ckpt
+*.out
+*.csv
+*.xlsx
+*.log
+*.pyc
+*.swp
+__pycache__/
+output/
+figures/
+checkpoint/
+*.ipynb

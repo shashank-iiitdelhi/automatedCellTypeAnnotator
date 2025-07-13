@@ -1,0 +1,298 @@
+import os
+import sys
+import glob
+import time
+import math
+import datetime
+import argparse
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import anndata as ad
+import mindspore as ms
+import mindspore.numpy as mnp
+# import mindspore.scipy as msc
+import mindspore.dataset as ds
+from tqdm import tqdm,trange
+from mindspore import nn,ops
+from scipy.sparse import csr_matrix as csm
+from mindspore.ops import operations as P
+from mindspore.amp import FixedLossScaleManager,all_finite,DynamicLossScaleManager
+from mindspore.train import Model, CheckpointConfig, ModelCheckpoint, LossMonitor
+from mindspore.context import ParallelMode
+from mindspore.communication import init, get_rank, get_group_size
+from mindspore.parallel._utils import _get_parallel_mode
+from mindspore.common.initializer import initializer, XavierNormal
+sys.path.append('../..')
+from config import Config
+from annotation_model import *
+from metrics import annote_metric
+from utils import Wrapper
+from data_process import Prepare
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+# Freezing the parameters of the backbone in the context of a zero-shot model.
+DATASET = "DCMACM_heart_cell"
+def freeze_module(module,filter_tag=[None]):
+    for param in module.trainable_params():
+        x=False
+        for tag in filter_tag:
+            if tag and tag in param.name:
+                x=True
+                break
+        param.requires_grad = x
+# Loading training and testing datasets in H5AD format.
+def read_h5ad(path):
+    train_data = sc.read_h5ad(path+f"/{DATASET}_train_top50pct.h5ad")
+    test_data = sc.read_h5ad(path+f"/{DATASET}_test_bottom50pct.h5ad")
+    
+    # test_data = sc.read_h5ad(path+"/PSC_Liver_train_top50pct.h5ad")
+    # train_data = sc.read_h5ad(path+"/PSC_Liver_test_bottom50pct.h5ad")
+
+    train_data.obs['train'] = 0
+    test_data.obs['train']  = 2
+    train_data.var_names_make_unique()
+    test_data.var_names_make_unique()
+
+    adata = ad.concat([train_data, test_data], join='outer')
+    print('origin shape:',adata.shape,len(adata.obs['cell_type'].unique()))
+        
+    data=adata.X.astype(np.float32)
+    T=adata.X.sum(1)
+    data=csm(np.round(data/np.maximum(1,T/1e5,dtype=np.float32)))
+    data.eliminate_zeros()
+    adata.X=data
+    
+    return adata
+class SCrna():
+    def __init__(self,adata,mode='train',prep=True):
+        # self.cls=len(adata.obs['cell_type'].unique())
+        if 'sctype_classification' not in adata.obs.columns:
+            raise ValueError("Missing 'sctype_classification' in .obs of the input AnnData object.")
+
+        self.cls=len(adata.obs['sctype_classification'].unique())
+        if mode=="train":
+            adata=adata[adata.obs.train==0]
+        elif mode=='val':
+            adata=adata[adata.obs.train==1]
+        else:
+            adata=adata[adata.obs.train==2]
+        self.gene_info=pd.read_csv(f'./expand_gene_info.csv',index_col=0,header=0)
+        self.geneset={j:i+1 for i,j in enumerate(self.gene_info.index)}
+        
+        gene=np.intersect1d(adata.var_names,self.gene_info.index)
+        adata=adata[:,gene].copy()
+        # adata.obs['cell_type']=adata.obs['cell_type'].astype('category')
+        # label=adata.obs['cell_type'].cat.codes.values
+        adata.obs['sctype_classification'] = adata.obs['sctype_classification'].astype('category')
+        label = adata.obs['sctype_classification'].cat.codes.values
+        adata.obs['label']=label
+        if prep:
+            adata.layers['x_normed']=sc.pp.normalize_total(adata,target_sum=1e4,inplace=False)['X']
+            adata.layers['x_log1p']=adata.layers['x_normed']
+            sc.pp.log1p(adata,layer='x_log1p')
+        self.adata=adata
+        # self.id2label=adata.obs['cell_type'].cat.categories.values
+        self.id2label = adata.obs['sctype_classification'].cat.categories.values
+
+        self.gene=np.array([self.geneset[i] for i in self.adata.var_names]).astype(np.int32)
+        self.cls=len(adata.obs['cell_type'].unique())
+        self.label=self.adata.obs['label'].values.astype(np.int32)
+        print(f'{mode} adata:',adata.shape,self.cls)
+        if prep:
+            self.data=self.adata.layers['x_log1p'].A.astype(np.float32)
+        else:
+            self.data=self.adata.X.astype(np.int32)
+    def __len__(self):
+        return len(self.adata)
+    def __getitem__(self,idx):
+        data=self.data[idx].reshape(-1)
+        label=self.label[idx]
+        return data,self.gene,label
+# Creating a data loader
+def build_dataset(
+    data,prep,batch,
+    rank_size=None,
+    rank_id=None,
+    drop=True,
+    shuffle=True
+):
+    dataset = ds.GeneratorDataset(
+        data, 
+        column_names=['data','gene','label'],
+        shuffle=shuffle,
+        num_shards=rank_size, 
+        shard_id=rank_id
+    )
+    dataset = dataset.map(
+        prep.seperate, input_columns=['data'],
+        output_columns=['data', 'nonz','zero']
+    )
+    dataset = dataset.map(
+        prep.sample, input_columns=['data','nonz','zero'],
+        output_columns=['data','nonz','cuted','z_sample','seq_len']
+    )
+    dataset = dataset.map(
+        prep.compress, input_columns=['data','nonz'],
+        output_columns=['data','nonz_data', 'nonz']
+    )
+    dataset = dataset.map(
+        prep.compress, input_columns=['gene','nonz'],
+        output_columns=['gene','nonz_gene', 'nonz']
+    )
+    dataset = dataset.map(
+        prep.attn_mask, input_columns=['seq_len'],
+        output_columns=['zero_idx']
+    )
+    dataset = dataset.map(prep.pad_zero, input_columns=['nonz_data'])
+    dataset = dataset.map(prep.pad_zero, input_columns=['nonz_gene'])
+    dataset=dataset.project(
+        columns=['nonz_data','nonz_gene','zero_idx','label']
+    )
+    dataset = dataset.batch(
+        batch,
+        num_parallel_workers=4, 
+        drop_remainder=drop, 
+    )
+    return dataset# Here, you can choose the type and number of the GPU, such as Ascend and GPU.
+ms.set_context(
+    device_target='GPU', 
+    mode=ms.GRAPH_MODE,
+    device_id=0,
+)
+ms.set_seed(0)
+adata=read_h5ad(f"./datasets")
+adata.var_names_make_unique()
+trainset=SCrna(adata,mode='train')
+testset=SCrna(adata,mode='test')
+cfg=Config()
+cfg.num_cls=trainset.cls
+cfg.enc_nlayers=2
+
+prep=Prepare(
+    cfg.nonz_len,pad=1,mask_ratio=0,random=False
+)
+train_loader = build_dataset(
+    trainset,
+    prep,
+    batch=32,
+    drop=True,
+    shuffle=True,
+    rank_size=1,
+    rank_id=0,
+)
+
+test_loader = build_dataset(
+    testset,
+    prep,
+    batch=1,
+    drop=False,
+    shuffle=False,
+    rank_size=1,
+    rank_id=0,
+)
+
+
+para=ms.load_checkpoint("./CellFM_80M_weight.ckpt")
+backbone=Backbone(len(trainset.geneset),cfg)
+ms.load_param_into_net(backbone, para)
+# backbone=Backbone(len(trainset.geneset),cfg)
+# filtered_para = {k: v for k, v in para.items() if "gene_emb" not in k}
+# ms.load_param_into_net(backbone, filtered_para)
+model=Net(backbone,cfg)
+freeze_module(model.extractor)
+from mindspore.train.callback import Callback
+
+class ProgressCallback(Callback):
+    def __init__(self, total_epochs):
+        self.total_epochs = total_epochs
+
+    def on_epoch_begin(self, run_context):
+        cb_params = run_context.original_args()
+        current_epoch = cb_params.cur_epoch_num
+        print(f"\n🟢 Starting Epoch {current_epoch}/{self.total_epochs}")
+
+    def on_step_end(self, run_context):
+        cb_params = run_context.original_args()
+        step = cb_params.cur_step_num
+        loss = cb_params.net_outputs
+        print(f"Step {step}, Loss: {loss.asnumpy():.4f}")
+optimizer=nn.Adam(model.trainable_params(),1e-4,weight_decay=1e-5)
+update_cell=nn.DynamicLossScaleUpdateCell(1,2,1000)
+wrapper=Wrapper(model,optimizer)
+trainer=Model(
+    wrapper,
+    eval_network=model,
+    amp_level='O0',
+    metrics={
+        'accuracy':annote_metric(trainset.cls,key='accuracy'),
+    },
+    eval_indexes=[0,1,2]
+)
+# loss_cb = LossMonitor(20)
+loss_cb = LossMonitor(10)
+ckpt_config = CheckpointConfig(
+    save_checkpoint_steps=len(train_loader),
+    keep_checkpoint_max=1,
+    integrated_save=False,
+    async_save=False
+)
+ckpt_cb = ModelCheckpoint(
+    prefix=f'zeroshot', 
+    directory=f"./checkpoint/", 
+    config=ckpt_config
+)
+cbs=[loss_cb,ckpt_cb]
+trainer.train(
+    1,
+    train_loader,
+    # callbacks=[loss_cb]
+    callbacks=[loss_cb, ckpt_cb,ProgressCallback(total_epochs=10)]
+)
+# === Load Latest Checkpoint ===
+print("✅ Model trained and checkpoint saved.")
+latest_ckpt_path = sorted(
+    glob.glob("./checkpoint/*.ckpt"),
+    key=os.path.getmtime
+)[-1]
+
+# print(f"Loading model from: {latest_ckpt_path}")
+# param_dict = ms.load_checkpoint(latest_ckpt_path)
+ms.load_param_into_net(model,  ms.load_checkpoint(latest_ckpt_path))
+
+results = trainer.eval(test_loader)
+print("🔎 Test Evaluation Results comparing scType vs Predicted Labels (not final):", results)
+
+# Predicting on the test set
+true_labels = []
+pred_labels = []
+model.set_train(False)
+print("🔄 Annotating test samples...")
+
+for batch in tqdm(test_loader.create_dict_iterator(output_numpy=True), total=len(testset), desc="📌 Annotating"):
+    _, labelpred1, _ = model(
+        ms.Tensor(batch['nonz_data']),
+        ms.Tensor(batch['nonz_gene']),
+        ms.Tensor(batch['zero_idx']),
+        ms.Tensor(batch['label'])
+    )
+    pred = labelpred1.argmax(axis=1).asnumpy()
+    true = batch['label']
+    pred_labels.extend(pred)
+    true_labels.extend(true)
+
+
+# Save CSV
+df_out = pd.DataFrame({
+    'sctype_classification': testset.adata.obs['sctype_classification'].values,
+    'mapped_cell_type': testset.adata.obs['mapped_cell_type'].values,
+    'Pred_labels': [testset.id2label[i] for i in pred_labels]
+})
+https://chatgpt.com/share/685fd8ff-f368-8003-ba90-efd9a53fd1d4
+# df_out.to_csv("prediction_results_PSC_Liver.csv", index=False)
+#df_out.to_csv("prediction_results_PSC_Liver_new_splitting_technique.csv", index=False)
+# df_out.to_csv("prediction_results_with_test_used_as_training_PSC_Liver.csv", index=False)
+print("📁 Saved prediction results with mapped labels to prediction_results.csv")
+

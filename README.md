@@ -46,17 +46,18 @@ The pipeline was tested on 85,000+ cells from three diseased tissue datasets:
 
 ## Project Structure
 
+```text
 Independent_One_Shot/
 │
-├── CellFM/ # CellFM model code and training logic
-├── preprocessingData/ # Scanpy + Anndata preprocessing scripts
-├── scType/ # Marker-based filtering and logic
-├── output/ # Output CSVs and logs (excluded from Git)
-├── figures/ # UMAP and clustering plots (excluded from Git)
-├── checkpoint/ # Model checkpoints (excluded from Git)
-├── .gitignore # Skips large or redundant files
-├── *.ckpt, *.csv, *.out # Trained model files and results (excluded)
-└── README.md # Project documentation
+├── CellFM/                 # CellFM model code and training logic
+├── preprocessingData/     # Scanpy + Anndata preprocessing scripts
+├── scType/                # Marker-based filtering and logic
+├── output/                # Output CSVs and logs (excluded from Git)
+├── figures/               # UMAP and clustering plots (excluded from Git)
+├── checkpoint/            # Model checkpoints (excluded from Git)
+├── .gitignore             # Skips large or redundant files
+├── *.ckpt, *.csv, *.out   # Trained model files and results (excluded)
+└── README.md              # Project documentation
 
 
 ---

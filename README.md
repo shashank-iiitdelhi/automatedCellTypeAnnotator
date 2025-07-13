@@ -70,8 +70,7 @@ Independent_One_Shot/
 - Required Python packages:
   ```bash
   pip install scanpy anndata pandas numpy
-- mindspore version 2.10.0
-- mindspore=2.2.10
+- mindspore=2.2.10 to 2.2.14
 - scanpy=1.10
 - scib=1.1.5
 ## How It Works (In Short)

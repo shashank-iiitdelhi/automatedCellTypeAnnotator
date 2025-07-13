@@ -66,10 +66,14 @@ Independent_One_Shot/
 
 ### Requirements
 
-- Python 3.8 or above
+- Python 3.9
 - Required Python packages:
   ```bash
   pip install scanpy anndata pandas numpy
+- mindspore version 2.10.0
+- mindspore=2.2.10
+- scanpy=1.10
+- scib=1.1.5
 ## How It Works (In Short)
 
 No labels → use marker genes to find reliable “seed” cells.
@@ -79,3 +83,7 @@ These cells → train classifier (CellFM).
 Classifier → annotate entire dataset.
 
 Saves days of manual work; accuracy on par with expert annotations.
+
+
+# Credit
+I would like to credit the CellFM(https://github.com/biomed-AI/CellFM) and scType(https://github.com/IanevskiAleksandr/sc-type) for their research papers on how the program works and existing pipelines which could be modified for requirement.
